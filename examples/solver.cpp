@@ -39,6 +39,7 @@
 
 #include <amgcl/relaxation/runtime.hpp>
 #include <amgcl/coarsening/runtime.hpp>
+#include <amgcl/coarsening/rigid_body_modes.hpp>
 #include <amgcl/solver/runtime.hpp>
 #include <amgcl/preconditioner/runtime.hpp>
 #include <amgcl/make_solver.hpp>
@@ -83,8 +84,6 @@ std::tuple<size_t, double> block_solve(
         amgcl::runtime::solver::wrapper<BBackend>
         > Solver;
 
-    ;
-
     auto A = amgcl::adapter::block_matrix<value_type>(std::tie(rows, ptr, col, val));
 
     std::tuple<size_t, double> info;
@@ -103,8 +102,8 @@ std::tuple<size_t, double> block_solve(
         rhs_type const * fptr = reinterpret_cast<rhs_type const *>(&rhs[0]);
         rhs_type       * xptr = reinterpret_cast<rhs_type       *>(&x[0]);
 
-        amgcl::backend::numa_vector<rhs_type> F(perm(boost::make_iterator_range(fptr, fptr + rows/B)));
-        amgcl::backend::numa_vector<rhs_type> X(perm(boost::make_iterator_range(xptr, xptr + rows/B)));
+        amgcl::backend::numa_vector<rhs_type> F(perm(amgcl::make_iterator_range(fptr, fptr + rows/B)));
+        amgcl::backend::numa_vector<rhs_type> X(perm(amgcl::make_iterator_range(xptr, xptr + rows/B)));
 
         prof.tic("solve");
         info = solve(F, X);
@@ -188,10 +187,10 @@ std::tuple<size_t, double> block_solve(
 
         std::vector<rhs_type> tmp(rows / B);
 
-        perm.forward(boost::make_iterator_range(fptr, fptr + rows/B), tmp);
+        perm.forward(amgcl::make_iterator_range(fptr, fptr + rows/B), tmp);
         vex::vector<rhs_type> f_b(ctx, tmp);
 
-        perm.forward(boost::make_iterator_range(xptr, xptr + rows/B), tmp);
+        perm.forward(amgcl::make_iterator_range(xptr, xptr + rows/B), tmp);
         vex::vector<rhs_type> x_b(ctx, tmp);
 
         prof.tic("solve");
@@ -402,6 +401,14 @@ int main(int argc, char *argv[]) {
          "Should only be provided together with a system matrix. "
         )
         (
+         "coords,C",
+         po::value<string>(),
+         "Coordinate matrix where number of rows corresponds to the number of grid nodes "
+         "and the number of columns corresponds to the problem dimensionality (2 or 3). "
+         "Will be used to construct near null-space vectors as rigid body modes. "
+         "Should only be provided together with a system matrix. "
+        )
+        (
          "binary,B",
          po::bool_switch()->default_value(false),
          "When specified, treat input files as binary instead of as MatrixMarket. "
@@ -453,14 +460,23 @@ int main(int argc, char *argv[]) {
         )
         ;
 
+    po::positional_options_description p;
+    p.add("prm", -1);
+
     po::variables_map vm;
-    po::store(po::parse_command_line(argc, argv, desc), vm);
+    po::store(po::command_line_parser(argc, argv).options(desc).positional(p).run(), vm);
     po::notify(vm);
 
     if (vm.count("help")) {
         std::cout << desc << std::endl;
         return 0;
     }
+
+    for (int i = 0; i < argc; ++i) {
+        if (i) std::cout << " ";
+        std::cout << argv[i];
+    }
+    std::cout << std::endl;
 
     boost::property_tree::ptree prm;
     if (vm.count("prm-file")) {
@@ -473,7 +489,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    size_t rows;
+    size_t rows, nv = 0;
     vector<ptrdiff_t> ptr, col;
     vector<double> val, rhs, null, x;
 
@@ -510,7 +526,7 @@ int main(int argc, char *argv[]) {
         if (vm.count("null")) {
             string nfile = vm["null"].as<string>();
 
-            size_t m, nv;
+            size_t m;
 
             if (binary) {
                 io::read_dense(nfile, m, nv, null);
@@ -519,7 +535,24 @@ int main(int argc, char *argv[]) {
             }
 
             precondition(m == rows, "Near null-space vectors have wrong size");
+        } else if (vm.count("coords")) {
+            string cfile = vm["coords"].as<string>();
+            std::vector<double> coo;
 
+            size_t m, ndim;
+
+            if (binary) {
+                io::read_dense(cfile, m, ndim, coo);
+            } else {
+                std::tie(m, ndim) = io::mm_reader(cfile)(coo);
+            }
+
+            precondition(m * ndim == rows && (ndim == 2 || ndim == 3), "Coordinate matrix has wrong size");
+
+            nv = amgcl::coarsening::rigid_body_modes(ndim, coo, null);
+        }
+
+        if (nv) {
             prm.put("precond.coarsening.nullspace.cols", nv);
             prm.put("precond.coarsening.nullspace.rows", rows);
             prm.put("precond.coarsening.nullspace.B",    &null[0]);
